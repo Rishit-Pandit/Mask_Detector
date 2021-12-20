@@ -1,0 +1,127 @@
+import os
+import cv2 as cv
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torchvision import transforms
+from facenet_pytorch import MTCNN
+import RPi.GPIO as GPIO
+import time
+
+# GPIO Basic initialization
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(True)
+
+class FaceRecognition(nn.Module):
+    def __init__(self):
+        super(FaceRecognition, self).__init__()
+
+class RecognitionModel(nn.Module):
+    def __init__(self):
+        super(RecognitionModel, self).__init__()
+        # Defining the bottom layers of the NN
+        self.bottom = models.mobilenet_v2(True, progress=True)
+        self.bottom = self.bottom.features
+        for params in self.bottom.parameters():
+            params.requires_grad = False
+        # Defining the top layers of the NN
+        self.top = nn.Sequential(
+            nn.Linear(in_features=1280*4*4, out_features=256),
+            nn.ReLU(),
+            nn.Linear(in_features=256, out_features=2),
+            nn.LogSoftmax(dim=1)
+        )
+
+    def forward(self, x):
+        # Defining the evaluation function of the NN
+        x = self.bottom(x)
+        x = x.view((x.shape[0], -1))
+        x = self.top(x)
+        return x
+
+
+class MaskRecognition(object):
+    def __init__(self, device=0):
+        # Defining the processor : CPU or GPU
+        self.device = torch.device(f"cuda:{device}") if device >= 0 else torch.device("cpu")
+        # Making an instance of the NN
+        self.model = RecognitionModel().to(self.device)
+        # # Initializing the serial communication
+        # self.com = serial.Serial("COM3", baudrate=19200)
+        # Loading the pretrained Model
+        self.model.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), "model", "model.pth"), map_location=self.device))
+        # Making an instance of the MTCNN
+        self.mtcnn = MTCNN(keep_all=True, device=self.device)
+        # Defining the transforms of the input images
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
+        # Giving the NN output a name each
+        self.result = {0: "with_mask", 1: "without_mask"}
+
+    def _predict(self, image):
+        # Applying the transform on the image and making it a tensor
+        tensor = self.transform(image).unsqueeze(0).to(self.device)
+        # Finding the probability of the Prediction
+        probability = torch.exp(self.model(tensor)[0])
+        # Finding the prediction of the NN
+        prediction = torch.argmax(probability).item()
+        return prediction, self.result[prediction], probability[prediction].item() * 100
+
+    def recognize(self, frame, color="rgb"):
+        frame = np.array(frame)
+        boxes, _ = self.mtcnn.detect(frame)
+        rois = []
+        faces = []
+        if boxes is not None:
+            for i in range(len(boxes)):
+                x1, y1, x2, y2 = int(round(boxes[i][0])), int(round(boxes[i][1])), int(round(boxes[i][2])), int(round(boxes[i][3]))
+                x1, y1, x2, y2 = max(x1, 0), max(y1, 0), max(x2, 0), max(y2, 0)
+                rois.append([frame[y1:y2, x1:x2, :], [x1, y1, x2, y2]])
+            for n, roi in enumerate(rois):
+                no, prediction, percent = self._predict(roi[0])
+                x1, y1, x2, y2 = roi[1]
+                box_color = [255, 0, 0] if prediction == "without_mask" else [0, 255, 0]
+                d = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+                if percent > 10 and d > 100:
+                    cv.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
+                    cv.rectangle(frame, (x1, y1 - 15), (x1 + (x2 - x1), y1), box_color, -1)
+                    cv.putText(frame, prediction + f" {percent:.2f}%", (x1, y1), cv.FONT_HERSHEY_PLAIN, 1, [0, 0, 0], 1)
+                    faces.append([no, prediction, percent])
+        else:
+            pass
+        if color == "bgr":
+            return cv.cvtColor(frame, cv.COLOR_RGB2BGR), faces
+        else:
+            return frame, faces
+
+    def send_data(self, data, pin=4):
+        if data[2] >= 50:
+            # Turn on the LED
+            print("---Maskless Face Detected---")
+            GPIO.output(pin, 1)
+        else:
+            # Turn off the LED
+            print("---Safe---")
+            GPIO.output(pin, 0)
+
+    def cam_capture(self, device_id=0):
+        cam = cv.VideoCapture(device_id)
+        success, frame = cam.read()
+        while success:
+            success, frame = cam.read()
+            frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            predicted_frame, faces = self.recognize(np.flip(frame, 1), "bgr")
+            cv.imshow("image", predicted_frame)
+            for face in faces:
+                send_data(face)
+            key = cv.waitKey(0)
+            if key & 0xff == 27:
+                break
+
+Detector = MaskRecognition()
+Detector.cam_capture()
